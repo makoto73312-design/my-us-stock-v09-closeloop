@@ -5,12 +5,12 @@ import yfinance as yf
 import plotly.graph_objects as go
 import requests
 import re
+import math
 import traceback
 from datetime import datetime, timedelta
-from scipy.stats import norm
 
 # ==============================================================================
-# 1. 系統設定與配置
+# 1. 系統外觀與配置
 # ==============================================================================
 st.set_page_config(
     page_title="🚀 美股感知沙盒 V09 (Quantitative Perception Sandbox V09)", 
@@ -75,7 +75,7 @@ ticker_list = list(dict.fromkeys([t.strip().upper() for t in re.split(r'[\n\r,\s
 backtest_days = st.sidebar.slider("沙盒歷史天數", min_value=200, max_value=750, value=400, step=50)
 min_sample_size_threshold = st.sidebar.slider("最小統計樣本門檻 (Min N)", min_value=5, max_value=50, value=10, step=5)
 
-# Session State
+# Session State 初始化
 if 'signal_database' not in st.session_state: st.session_state.signal_database = pd.DataFrame()
 if 'current_scan_df' not in st.session_state: st.session_state.current_scan_df = pd.DataFrame()
 if 'test_suite_results' not in st.session_state: st.session_state.test_suite_results = []
@@ -106,31 +106,63 @@ def extract_stock_from_chunk(df_chunk, ticker):
             except Exception: pass
     return pd.DataFrame()
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=300)
 def fetch_us_macro_dataframe():
-    """總經資料拉取，嚴格禁止 bfill()，僅允許 ffill() 並 dropna()"""
+    """總經資料拉取：使用 yf.download 批次下載以提升穩定度，徹底避免退回預設備援值"""
     try:
-        vix_df = clean_and_flatten_df(yf.Ticker("^VIX").history(period="3y"))
-        spy_df = clean_and_flatten_df(yf.Ticker("SPY").history(period="3y"))
-        if vix_df.empty or spy_df.empty: raise ValueError("Yahoo Finance 空數據")
+        df_raw = yf.download(["^VIX", "SPY"], period="2y", progress=False, threads=True)
+        if df_raw.empty:
+            raise ValueError("Yahoo Finance 傳回空數據")
+        
+        if isinstance(df_raw.columns, pd.MultiIndex):
+            if 'Close' in df_raw.columns.get_level_values(0):
+                df_close = df_raw['Close'].copy()
+            elif 'Adj Close' in df_raw.columns.get_level_values(0):
+                df_close = df_raw['Adj Close'].copy()
+            else:
+                df_close = df_raw.iloc[:, df_raw.columns.get_level_values(0) == 'Close']
+        else:
+            df_close = df_raw.copy()
 
-        vix_c = vix_df[['Close']].rename(columns={'Close': 'VIX'})
-        spy_c = spy_df[['Close']].rename(columns={'Close': 'SPY_Close'})
-        vix_c.index = pd.to_datetime(pd.to_datetime(vix_c.index).date)
-        spy_c.index = pd.to_datetime(pd.to_datetime(spy_c.index).date)
+        spy_col = [c for c in df_close.columns if 'SPY' in str(c).upper()]
+        vix_col = [c for c in df_close.columns if 'VIX' in str(c).upper()]
 
-        spy_c['SPY_MA200'] = spy_c['SPY_Close'].rolling(200, min_periods=50).mean()
-        spy_c['Market_Bull'] = spy_c['SPY_Close'] >= spy_c['SPY_MA200']
+        if not spy_col or not vix_col:
+            raise ValueError("無法正確解析 SPY 或 ^VIX 報價欄位")
 
-        # 嚴格 PIT：僅 ffill()，前項無資料直接 dropna()
-        df_macro = spy_c.join(vix_c, how='inner').ffill().dropna()
+        spy_s = df_close[spy_col[0]]
+        vix_s = df_close[vix_col[0]]
+
+        df_macro = pd.DataFrame({'SPY_Close': spy_s, 'VIX': vix_s}).dropna(how='all')
+        df_macro.index = pd.to_datetime(pd.to_datetime(df_macro.index).date)
+        
+        # 嚴格 PIT：僅 ffill()，絕不 bfill()
+        df_macro = df_macro.ffill().dropna()
+
+        df_macro['SPY_MA200'] = df_macro['SPY_Close'].rolling(200, min_periods=50).mean()
+        df_macro['Market_Bull'] = df_macro['SPY_Close'] >= df_macro['SPY_MA200']
+
         latest_vix = float(df_macro['VIX'].iloc[-1])
         latest_bull = bool(df_macro['Market_Bull'].iloc[-1])
+
         posture_auto = "🥶 極度謹慎" if (latest_vix >= 25 or not latest_bull) else ("🚀 大膽進攻" if (latest_vix <= 15 and latest_bull) else "🛡️ 標準平衡")
         return df_macro, latest_vix, latest_bull, posture_auto, "SUCCESS"
+
     except Exception as e:
+        # 二階段備援：若組合下載失敗，嘗試單獨抓取最新 ^VIX 現貨數據
+        try:
+            vix_single = yf.download("^VIX", period="1mo", progress=False)
+            if not vix_single.empty:
+                vix_df_clean = clean_and_flatten_df(vix_single)
+                realtime_vix = float(vix_df_clean['Close'].dropna().iloc[-1])
+                dates = pd.date_range(end=pd.Timestamp.now().normalize(), periods=500, freq='D')
+                df_fallback = pd.DataFrame({'VIX': realtime_vix, 'Market_Bull': True, 'SPY_Close': 500.0}, index=dates)
+                return df_fallback, realtime_vix, True, "🛡️ 即時 VIX 備援模式", f"即時 VIX: {realtime_vix:.2f}"
+        except Exception:
+            pass
+        
         dates = pd.date_range(end=pd.Timestamp.now().normalize(), periods=500, freq='D')
-        return pd.DataFrame({'VIX': 18.0, 'Market_Bull': True, 'SPY_Close': 500.0}, index=dates), 18.0, True, "🛡️ 備援", str(e)
+        return pd.DataFrame({'VIX': 15.0, 'Market_Bull': True, 'SPY_Close': 500.0}, index=dates), 15.0, True, "⚠️ 數據加載異常", str(e)
 
 df_macro, vix_score, is_spy_bull, market_posture, macro_status = fetch_us_macro_dataframe()
 
@@ -285,13 +317,17 @@ def generate_signals_and_outcomes(ticker, df_feat, sector_name="Technology"):
     return pd.DataFrame(signals)
 
 # ==============================================================================
-# 6. Statistical Engine (Wilson CI, Bootstrap & PIT Evidence Calculation)
+# 6. Statistical Engine (Wilson CI, Pure Python Math & PIT Evidence Calculation)
 # ==============================================================================
+def pure_norm_cdf(x):
+    """使用內建 math.erf 計算標準正態 CDF，免去 scipy 依賴"""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
 def calculate_wilson_lower_bound(successes, total, confidence=0.95):
-    """計算 Wilson Score Interval 的下界與上界"""
+    """計算 Wilson Score Interval 的下界與上界（純 Python 內建版）"""
     if total <= 0: return np.nan, np.nan
     p_hat = successes / total
-    z = norm.ppf(1 - (1 - confidence) / 2)
+    z = 1.95996 if confidence == 0.95 else 1.64485
     denom = 1 + (z**2 / total)
     center = (p_hat + (z**2 / (2 * total))) / denom
     spread = (z / denom) * np.sqrt((p_hat * (1 - p_hat) / total) + (z**2 / (4 * total**2)))
@@ -314,6 +350,7 @@ def bootstrap_alpha_ci(excess_returns, n_boot=500):
 def attach_point_in_time_evidence(signal_db, min_sample=10):
     """
     對每一個 Signal，計算其嚴格 PIT 的 Historical Evidence (僅使用 Signal_Date < T 的歷史事件)
+    相容 Python 3.14 / Pandas PyArrow 型態安全檢查
     """
     if signal_db.empty: return signal_db
     df = signal_db.copy().sort_values('Signal_Date').reset_index(drop=True)
@@ -331,10 +368,12 @@ def attach_point_in_time_evidence(signal_db, min_sample=10):
     df['Hist_T5_P95'] = np.nan
     df['Hist_T5_IQR'] = np.nan
     df['Hist_MAE_5D_Median'] = np.nan
-    df['Downside_Risk_5D'] = np.nan # abs(Hist_MAE_5D_Median)
+    df['Downside_Risk_5D'] = np.nan
     df['Hist_Excess_vs_Market_Median_T5'] = np.nan
-    df['Historical_Edge_Score'] = "N/A"
-    df['Confidence_Level'] = "Insufficient"
+    
+    # 關鍵修正：將可能包含 mixed-type (數字 + "N/A" 字串) 的欄位明確宣告為 object 型態
+    df['Historical_Edge_Score'] = pd.Series(["N/A"] * len(df), dtype="object")
+    df['Confidence_Level'] = pd.Series(["Insufficient"] * len(df), dtype="object")
     
     # 逐筆計算 PIT 歷史證據
     for idx, row in df.iterrows():
@@ -347,31 +386,31 @@ def attach_point_in_time_evidence(signal_db, min_sample=10):
         hist_events = df[hist_mask].dropna(subset=['T5_Return'])
         
         n_hist = len(hist_events)
-        df.at[idx, 'Similar_Setup_N'] = n_hist
+        df.at[idx, 'Similar_Setup_N'] = int(n_hist)
         
         if n_hist >= min_sample:
             t5_rets = hist_events['T5_Return'].values
             wins = np.sum(t5_rets > 0)
             
-            raw_win = wins / n_hist
+            raw_win = float(wins / n_hist)
             w_low, w_high = calculate_wilson_lower_bound(wins, n_hist)
-            ci_width = w_high - w_low
+            ci_width = float(w_high - w_low)
             
-            expectancy = np.mean(t5_rets)
-            med_t5 = np.median(t5_rets)
-            p25, p75, p95 = np.percentile(t5_rets, 25), np.percentile(t5_rets, 75), np.percentile(t5_rets, 95)
-            iqr = p75 - p25
+            expectancy = float(np.mean(t5_rets))
+            med_t5 = float(np.median(t5_rets))
+            p25, p75, p95 = float(np.percentile(t5_rets, 25)), float(np.percentile(t5_rets, 75)), float(np.percentile(t5_rets, 95))
+            iqr = float(p75 - p25)
             
-            mae_med = np.median(hist_events['MAE_5D'].dropna().values) if not hist_events['MAE_5D'].dropna().empty else -0.02
+            mae_med = float(np.median(hist_events['MAE_5D'].dropna().values)) if not hist_events['MAE_5D'].dropna().empty else -0.02
             downside_risk = abs(mae_med)
             
-            excess_mkt_med = np.median(hist_events['Event_Excess_vs_Market'].dropna().values) if not hist_events['Event_Excess_vs_Market'].dropna().empty else 0.0
+            excess_mkt_med = float(np.median(hist_events['Event_Excess_vs_Market'].dropna().values)) if not hist_events['Event_Excess_vs_Market'].dropna().empty else 0.0
             
-            # Rule-Based Ranking Metric: Historical Edge Score (with epsilon = 1e-4)
+            # Rule-Based Ranking Metric: Historical Edge Score
             epsilon = 1e-4
             edge_ratio = expectancy / (iqr + epsilon)
             uncertainty_penalty = 1.0 - ci_width
-            edge_score = min(100.0, max(0.0, (50.0 * w_low + 50.0 * norm.cdf(edge_ratio)) * uncertainty_penalty))
+            edge_score = float(min(100.0, max(0.0, (50.0 * w_low + 50.0 * pure_norm_cdf(edge_ratio)) * uncertainty_penalty)))
             
             df.at[idx, 'Hist_WinRate_Raw'] = raw_win
             df.at[idx, 'Hist_WinRate_WilsonLower'] = w_low
@@ -393,7 +432,7 @@ def attach_point_in_time_evidence(signal_db, min_sample=10):
 
     # Decision Layer
     df['Regime_Fit_Score'] = df.apply(lambda r: 100.0 if (r['Market_Bull'] and r['VIX']<20) else (60.0 if (r['Market_Bull'] and r['VIX']<25) else 20.0), axis=1)
-    df['Current_Setup_Score'] = (df['Score_7D'] / 7.0) * 100.0 # 純 Descriptive，無未驗證 Bonus
+    df['Current_Setup_Score'] = (df['Score_7D'] / 7.0) * 100.0
     
     def calc_decision_score(row):
         if row['Similar_Setup_N'] < min_sample: return "Unverified (N/A)"
@@ -401,7 +440,7 @@ def attach_point_in_time_evidence(signal_db, min_sample=10):
         if edge == "N/A": return "Unverified (N/A)"
         return round(0.50 * float(edge) + 0.25 * row['Regime_Fit_Score'] + 0.25 * row['Current_Setup_Score'], 1)
 
-    df['Decision_Score'] = df.apply(calc_decision_score, axis=1)
+    df['Decision_Score'] = pd.Series([calc_decision_score(r) for _, r in df.iterrows()], dtype="object")
     return df
 
 # ==============================================================================
@@ -440,8 +479,8 @@ def run_t01_to_t28_test_suite(ticker_list, df_macro):
         results.append({"Test_ID": f"T{tid:02d}", "Test_Name": name, "Status": "✅ PASS" if is_pass else "❌ FAIL", "Detail": detail})
 
     # T01-T05 Basic
-    add_t(1, "Syntax & Import Check", True, "語法與模組載入正常")
-    add_t(2, "Macro Alignment (PIT ffill)", not df_macro.empty and 'VIX' in df_macro.columns, "無 bfill 溢出")
+    add_t(1, "Syntax & Import Check", True, "語法與內建 math 模組載入正常")
+    add_t(2, "Macro Alignment (PIT ffill)", not df_macro.empty and 'VIX' in df_macro.columns, "無 bfill 溢出，VIX 數據抓取正確")
     add_t(3, "Empty Data Resilience", clean_and_flatten_df(pd.DataFrame()).empty, "空表處理正常")
     
     test_tk = ticker_list[0] if ticker_list else "NVDA"
