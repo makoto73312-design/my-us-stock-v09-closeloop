@@ -305,10 +305,13 @@ def fetch_us_macro_dataframe_fail_closed():
 df_macro, vix_score, is_spy_bull, market_posture, macro_status, macro_source, macro_asof = fetch_us_macro_dataframe_fail_closed()
 
 # ==============================================================================
-# 4. Feature Engine (Point-in-Time & Feature Guard)
+# 4. Feature Engine (Point-in-Time & Feature Guard & Empty Resilience Fix)
 # ==============================================================================
 def calculate_features(df, df_macro_input):
     df = clean_and_flatten_df(df)
+    if df.empty or not all(col in df.columns for col in ['Open', 'High', 'Low', 'Close', 'Volume']):
+        return pd.DataFrame()
+        
     df.index = pd.to_datetime(pd.to_datetime(df.index).date)
     df = df.join(df_macro_input[['VIX', 'Market_Bull', 'SPY_Close', 'SPY_Open']], how='left').ffill()
 
@@ -1175,7 +1178,7 @@ with tab_gate_oos:
     else: st.info("💡 請先啟動沙盒運算。")
 
 with tab_perf:
-    st.header("⚡ 效能 Profiler 與 Horizon 成熟度稽核報告")
+    st.header("⚡ 效能 Profiler 與 Horizon 成成熟度稽核報告")
     if st.session_state.calculated:
         c_p1, c_p2 = st.columns(2)
         with c_p1:
