@@ -1100,36 +1100,118 @@ def run_executable_test_suite_v0941b(ticker_list, df_strat, df_stock_events, df_
     add_tech(19, "Missing Value Imputation Test", "NOT_AUTOMATED", "NOT_AUTOMATED", "Skipped", status_override="NOT_AUTOMATED")
     add_tech(20, "Full Sandbox End-to-End Regression", len(df_stock_events) > 0, True, f"Pipeline returned {len(df_stock_events)} stock events")
 
-    # Fix P0-4: True Executable T21 Horizon Maturity Isolation Audit
+    # Fix T21 Horizon Maturity Isolation Audit (V09.4.1c Hotfix)
     t21_pass = True
+    t21_status_override = None
     t21_detail = ""
-    if not df_strat.empty:
-        # Check 1: Stats_AsOf < Signal_Date for all rows
-        leak_detected = False
-        for k in [1, 3, 5, 10, 20]:
-            col_asof = f"Stats_AsOf_T{k}"
-            if col_asof in df_strat.columns:
-                valid_mask = (df_strat[col_asof] != "N/A") & df_strat[col_asof].notna()
-                if (df_strat.loc[valid_mask, col_asof] >= df_strat.loc[valid_mask, 'Signal_Date']).any():
-                    leak_detected = True
-                    break
-        
-        # Check 2: Sample row historical pool reconstruction match
-        sample_row = df_strat.iloc[0]
-        sig_date = sample_row['Signal_Date']
-        reconstructed_pool_count = len(df_strat[(df_strat['Outcome_Available_Date_T5'] < sig_date) & df_strat['T5_Return'].notna()])
-        
-        if leak_detected:
-            t21_pass = False
-            t21_detail = "FAIL: Stats_AsOf date >= Signal_Date detected"
-        else:
-            t21_pass = True
-            t21_detail = f"PASS: True executable audit verified. Stats_AsOf < Signal_Date strictly enforced across T1/T3/T5/T10/T20. Sample reconstructed N matches."
-    else:
-        t21_pass = True
-        t21_detail = "PASS: Empty dataset default pass"
 
-    add_tech(21, "Horizon Maturity Isolation Audit", t21_pass, True, t21_detail)
+    if df_strat.empty:
+        t21_status_override = "SKIPPED"
+        t21_pass = False
+        t21_detail = "SKIPPED: Empty dataset"
+    else:
+        # Level 1: Check Stats_AsOf_Tk < Signal_Date for all rows with Hist_Tk_N > 0
+        l1_pass = True
+        for k in [1, 3, 5, 10, 20]:
+            col_n = f"Hist_T{k}_N"
+            col_asof = f"Stats_AsOf_T{k}"
+            if col_n in df_strat.columns and col_asof in df_strat.columns:
+                mask = (df_strat[col_n] > 0) & (df_strat[col_asof] != "N/A") & df_strat[col_asof].notna()
+                if (df_strat.loc[mask, col_asof] >= df_strat.loc[mask, 'Signal_Date']).any():
+                    l1_pass = False
+                    t21_detail = f"FAIL: Level 1 violation - Stats_AsOf_T{k} >= Signal_Date found"
+                    break
+
+        if not l1_pass:
+            t21_pass = False
+        else:
+            # Level 2: True Reconstruction Test
+            random.seed(42)
+            n_samples = min(30, len(df_strat))
+            sample_indices = random.sample(range(len(df_strat)), n_samples)
+            sample_rows = df_strat.iloc[sample_indices]
+
+            l2_pass = True
+            mismatch_msg = ""
+
+            for _, row in sample_rows.iterrows():
+                if not l2_pass:
+                    break
+                
+                curr_sig_date = row['Signal_Date']
+                strat = row['Strategy']
+                sim_lvl = str(row['Similarity_Level'])
+                mkt_regime = row['Market_Regime_Cluster']
+                bb_state = row['BB_State']
+                bucket_7d = row['7D_Bucket']
+                bucket_rs20 = row['RS20_Bucket']
+
+                for k in [1, 3, 5, 10, 20]:
+                    col_avail = f"Outcome_Available_Date_T{k}"
+                    col_ret = f"T{k}_Return"
+                    col_n = f"Hist_T{k}_N"
+                    col_asof = f"Stats_AsOf_T{k}"
+
+                    hist_pool = df_strat[
+                        (df_strat[col_avail] < curr_sig_date) & 
+                        df_strat[col_ret].notna()
+                    ]
+
+                    if sim_lvl == "L1":
+                        matched_pool = hist_pool[hist_pool['Strategy'] == strat]
+                    elif sim_lvl == "L2":
+                        matched_pool = hist_pool[
+                            (hist_pool['Strategy'] == strat) & 
+                            (hist_pool['Market_Regime_Cluster'] == mkt_regime)
+                        ]
+                    elif sim_lvl == "L3":
+                        matched_pool = hist_pool[
+                            (hist_pool['Strategy'] == strat) & 
+                            (hist_pool['Market_Regime_Cluster'] == mkt_regime) & 
+                            (hist_pool['BB_State'] == bb_state)
+                        ]
+                    elif sim_lvl == "L4":
+                        matched_pool = hist_pool[
+                            (hist_pool['Strategy'] == strat) & 
+                            (hist_pool['Market_Regime_Cluster'] == mkt_regime) & 
+                            (hist_pool['BB_State'] == bb_state) & 
+                            (hist_pool['7D_Bucket'] == bucket_7d)
+                        ]
+                    elif sim_lvl == "L5":
+                        matched_pool = hist_pool[
+                            (hist_pool['Strategy'] == strat) & 
+                            (hist_pool['Market_Regime_Cluster'] == mkt_regime) & 
+                            (hist_pool['BB_State'] == bb_state) & 
+                            (hist_pool['7D_Bucket'] == bucket_7d) & 
+                            (hist_pool['RS20_Bucket'] == bucket_rs20)
+                        ]
+                    else:
+                        matched_pool = df_strat.iloc[0:0]
+
+                    reconstructed_n = len(matched_pool)
+                    recorded_n = row[col_n]
+
+                    if reconstructed_n != recorded_n:
+                        l2_pass = False
+                        mismatch_msg = f"FAIL: Reconstructed N ({reconstructed_n}) != recorded {col_n} ({recorded_n}) for signal {row['Signal_ID']}"
+                        break
+
+                    if reconstructed_n > 0:
+                        max_avail_date = matched_pool[col_avail].max()
+                        recorded_asof = row[col_asof]
+                        if max_avail_date != recorded_asof:
+                            l2_pass = False
+                            mismatch_msg = f"FAIL: Reconstructed max available date ({max_avail_date}) != recorded {col_asof} ({recorded_asof}) for signal {row['Signal_ID']}"
+                            break
+
+            if l2_pass:
+                t21_pass = True
+                t21_detail = f"PASS: Verified Level 1 isolation and Level 2 pool reconstruction on {n_samples} sample rows across all horizons"
+            else:
+                t21_pass = False
+                t21_detail = mismatch_msg
+
+    add_tech(21, "Horizon Maturity Isolation Audit", t21_pass, True, t21_detail, status_override=t21_status_override)
     add_tech(22, "Entry Price Positivity Check", bool((df_strat['Entry_Price_T1Open'] > 0).all()), True, "All T+1 entry prices positive")
 
     t23_model_pass = len(MODEL_FEATURE_COLUMNS.intersection(FORBIDDEN_FEATURE_COLUMNS)) == 0
@@ -1411,5 +1493,5 @@ with tab_export:
         c10.download_button("💾 ticker_master.csv", st.session_state.ticker_master_export.to_csv(index=False).encode('utf-8-sig'), "ticker_master.csv", "text/csv")
         
         st.markdown("---")
-        st.download_button("💾 美股量化感知沙盒 V09.4.1b.txt", open(__file__, 'r', encoding='utf-8').read().encode('utf-8-sig') if '__file__' in globals() else "".encode('utf-8'), "美股量化感知沙盒 V09.4.1b.txt", "text/plain", use_container_width=True)
+        st.download_button("💾 美股量化感知沙盒 V09.4.1c.txt", open(__file__, 'r', encoding='utf-8').read().encode('utf-8-sig') if '__file__' in globals() else "".encode('utf-8'), "美股量化感知沙盒 V09.4.1c.txt", "text/plain", use_container_width=True)
     else: st.info("💡 請先啟動沙盒運算。")
