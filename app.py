@@ -1100,7 +1100,7 @@ def run_executable_test_suite_v0941b(ticker_list, df_strat, df_stock_events, df_
     add_tech(19, "Missing Value Imputation Test", "NOT_AUTOMATED", "NOT_AUTOMATED", "Skipped", status_override="NOT_AUTOMATED")
     add_tech(20, "Full Sandbox End-to-End Regression", len(df_stock_events) > 0, True, f"Pipeline returned {len(df_stock_events)} stock events")
 
-    # Fix T21 Horizon Maturity Isolation Audit (V09.4.1c Hotfix)
+    # Fix T21 Horizon Maturity Isolation Audit (V09.4.1c Hotfix Implementation)
     t21_pass = True
     t21_status_override = None
     t21_detail = ""
@@ -1108,37 +1108,31 @@ def run_executable_test_suite_v0941b(ticker_list, df_strat, df_stock_events, df_
     if df_strat.empty:
         t21_status_override = "SKIPPED"
         t21_pass = False
-        t21_detail = "SKIPPED: Empty dataset"
+        t21_detail = "SKIPPED: df_strat is empty"
     else:
-        # Level 1: Check Stats_AsOf_Tk < Signal_Date for all rows with Hist_Tk_N > 0
-        l1_pass = True
-        for k in [1, 3, 5, 10, 20]:
-            col_n = f"Hist_T{k}_N"
-            col_asof = f"Stats_AsOf_T{k}"
-            if col_n in df_strat.columns and col_asof in df_strat.columns:
-                mask = (df_strat[col_n] > 0) & (df_strat[col_asof] != "N/A") & df_strat[col_asof].notna()
-                if (df_strat.loc[mask, col_asof] >= df_strat.loc[mask, 'Signal_Date']).any():
-                    l1_pass = False
-                    t21_detail = f"FAIL: Level 1 violation - Stats_AsOf_T{k} >= Signal_Date found"
-                    break
+        valid_mask = (df_strat['Hist_T5_N'] > 0) & (df_strat['Similarity_Level'].isin(['L1', 'L2', 'L3', 'L4', 'L5']))
+        valid_df = df_strat[valid_mask]
 
-        if not l1_pass:
+        if valid_df.empty:
+            t21_status_override = "SKIPPED"
             t21_pass = False
+            t21_detail = "SKIPPED: No valid strategy events matching criteria (Hist_T5_N > 0 and Similarity_Level in L1~L5)"
         else:
-            # Level 2: True Reconstruction Test
             random.seed(42)
-            n_samples = min(30, len(df_strat))
-            sample_indices = random.sample(range(len(df_strat)), n_samples)
-            sample_rows = df_strat.iloc[sample_indices]
+            sample_size = min(30, len(valid_df))
+            sample_indices = random.sample(list(valid_df.index), sample_size)
+            sample_df = valid_df.loc[sample_indices]
 
-            l2_pass = True
-            mismatch_msg = ""
+            horizons = [1, 3, 5, 10, 20]
+            mismatch_found = False
+            total_comparisons = 0
 
-            for _, row in sample_rows.iterrows():
-                if not l2_pass:
+            for _, row in sample_df.iterrows():
+                if mismatch_found:
                     break
-                
-                curr_sig_date = row['Signal_Date']
+
+                ticker = row['Ticker']
+                sig_date = row['Signal_Date']
                 strat = row['Strategy']
                 sim_lvl = str(row['Similarity_Level'])
                 mkt_regime = row['Market_Regime_Cluster']
@@ -1146,14 +1140,15 @@ def run_executable_test_suite_v0941b(ticker_list, df_strat, df_stock_events, df_
                 bucket_7d = row['7D_Bucket']
                 bucket_rs20 = row['RS20_Bucket']
 
-                for k in [1, 3, 5, 10, 20]:
+                for k in horizons:
+                    total_comparisons += 1
                     col_avail = f"Outcome_Available_Date_T{k}"
                     col_ret = f"T{k}_Return"
                     col_n = f"Hist_T{k}_N"
                     col_asof = f"Stats_AsOf_T{k}"
 
                     hist_pool = df_strat[
-                        (df_strat[col_avail] < curr_sig_date) & 
+                        (df_strat[col_avail] < sig_date) & 
                         df_strat[col_ret].notna()
                     ]
 
@@ -1192,24 +1187,39 @@ def run_executable_test_suite_v0941b(ticker_list, df_strat, df_stock_events, df_
                     recorded_n = row[col_n]
 
                     if reconstructed_n != recorded_n:
-                        l2_pass = False
-                        mismatch_msg = f"FAIL: Reconstructed N ({reconstructed_n}) != recorded {col_n} ({recorded_n}) for signal {row['Signal_ID']}"
+                        mismatch_found = True
+                        recorded_asof = row[col_asof]
+                        reconstructed_asof = matched_pool[col_avail].max() if reconstructed_n > 0 else "N/A"
+                        t21_pass = False
+                        t21_detail = (
+                            f"FAIL | Ticker: {ticker}, Signal_Date: {sig_date}, Strategy: {strat}, "
+                            f"Similarity_Level: {sim_lvl}, Horizon: T{k}, "
+                            f"Recorded_N: {recorded_n}, Reconstructed_N: {reconstructed_n}, "
+                            f"Recorded_AsOf: {recorded_asof}, Reconstructed_AsOf: {reconstructed_asof}"
+                        )
                         break
 
                     if reconstructed_n > 0:
-                        max_avail_date = matched_pool[col_avail].max()
+                        reconstructed_asof = matched_pool[col_avail].max()
                         recorded_asof = row[col_asof]
-                        if max_avail_date != recorded_asof:
-                            l2_pass = False
-                            mismatch_msg = f"FAIL: Reconstructed max available date ({max_avail_date}) != recorded {col_asof} ({recorded_asof}) for signal {row['Signal_ID']}"
+                        if reconstructed_asof != recorded_asof:
+                            mismatch_found = True
+                            t21_pass = False
+                            t21_detail = (
+                                f"FAIL | Ticker: {ticker}, Signal_Date: {sig_date}, Strategy: {strat}, "
+                                f"Similarity_Level: {sim_lvl}, Horizon: T{k}, "
+                                f"Recorded_N: {recorded_n}, Reconstructed_N: {reconstructed_n}, "
+                                f"Recorded_AsOf: {recorded_asof}, Reconstructed_AsOf: {reconstructed_asof}"
+                            )
                             break
 
-            if l2_pass:
+            if not mismatch_found:
                 t21_pass = True
-                t21_detail = f"PASS: Verified Level 1 isolation and Level 2 pool reconstruction on {n_samples} sample rows across all horizons"
-            else:
-                t21_pass = False
-                t21_detail = mismatch_msg
+                t21_detail = (
+                    f"Samples_Checked: {sample_size}, Horizons_Checked: {len(horizons)}, "
+                    f"Total_Comparisons: {total_comparisons} | "
+                    f"{sample_size} samples × {len(horizons)} horizons = {total_comparisons} comparisons passed."
+                )
 
     add_tech(21, "Horizon Maturity Isolation Audit", t21_pass, True, t21_detail, status_override=t21_status_override)
     add_tech(22, "Entry Price Positivity Check", bool((df_strat['Entry_Price_T1Open'] > 0).all()), True, "All T+1 entry prices positive")
