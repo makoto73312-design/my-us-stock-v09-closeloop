@@ -1,4 +1,35 @@
 import os
+import sys
+
+# 確保 Streamlit Cloud 能正確找到專案根目錄與所有子套件
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import hashlib
+import json
+import time
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from core import (
+    ENTRY_NAME_ID,
+    ENTRY_TICKER_ID,
+    GOOGLE_FORM_ID,
+    GSHEET_URL,
+    VERSION,
+    VERSION_NAME,
+    generate_run_id,
+    get_gen_time,
+)
+from data import (
+    compute_data_snapshot_content_hash,
+    compute_ticker_master_hash,
+    extract_stock_from_chunk,
+    fetch_us_macro_dataframe_fail_closed_v0941b,
+    load_tickers_from_gsheet,
+    update_and_audit_taxonomy_master,
+)
+import os
 import requests
 import streamlit as st
 import pandas as pd
